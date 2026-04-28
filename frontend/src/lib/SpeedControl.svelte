@@ -1,15 +1,20 @@
 <script lang="ts">
-  let { speed = $bindable(1.0) }: { speed: number } = $props()
+  let { speed = $bindable(1.0), onSpeedChange }: { speed: number; onSpeedChange?: (s: number) => void } = $props()
 
   const presets = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 
+  function setSpeed(s: number) {
+    speed = s
+    onSpeedChange?.(s)
+  }
+
   function handleSlider(e: Event) {
     const target = e.target as HTMLInputElement
-    speed = parseFloat(target.value)
+    setSpeed(parseFloat(target.value))
   }
 
   function nudge(amount: number) {
-    speed = Math.round(Math.max(0.25, Math.min(2.0, speed + amount)) * 100) / 100
+    setSpeed(Math.round(Math.max(0.25, Math.min(2.0, speed + amount)) * 100) / 100)
   }
 </script>
 
@@ -50,7 +55,7 @@
   <div class="flex gap-1.5 flex-wrap">
     {#each presets as preset}
       <button
-        onclick={() => speed = preset}
+        onclick={() => setSpeed(preset)}
         class="text-xs px-2.5 py-1 rounded transition-colors {Math.abs(speed - preset) < 0.01
           ? 'bg-white text-black'
           : 'bg-neutral-800 text-neutral-400 hover:text-white'}"
