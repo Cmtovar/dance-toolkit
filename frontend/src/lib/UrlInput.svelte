@@ -1,6 +1,6 @@
 <script lang="ts">
   let { onSubmit }: { onSubmit: (url: string) => void } = $props()
-  let url = $state('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+  let url = $state('')
 
   function handleSubmit(e: Event) {
     e.preventDefault()
