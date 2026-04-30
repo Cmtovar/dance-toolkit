@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import SpeedControl from './SpeedControl.svelte'
-  import { api, type Routine, type Move } from './api'
+  import Recorder from './Recorder.svelte'
+  import { api, type Routine, type Move, type Attempt } from './api'
+  import { getVideo, deleteVideo, getRoutineVideo, saveRoutineVideo } from './videoStore'
 
   let { videoId, sourceUrl, onBack }: {
     videoId: string
@@ -18,20 +20,22 @@
   let duration = $state(0)
   const playerId = 'yt-player-' + Math.random().toString(36).slice(2)
 
-  // Routine state — loaded or created from the video
+  // Routine state
   let routine = $state<Routine | null>(null)
   let markers = $state<Move[]>([])
   let activeSegmentIndex = $state(-1)
   let timeUpdateInterval: number
 
-  // Speed tier state
-  let speedTiers = $state<{ rate: number; size: number }[]>([])
-  let tierStatus = $state<string>('idle')
-  let tierError = $state<string | null>(null)
+  // Attempt playback state
+  let reviewingAttempt = $state<Attempt | null>(null)
+
+  // Local video state (single cached file, client-side playbackRate for all speeds)
   let useLocalVideo = $state(false)
-  let activeTierRate = $state(1.0)
+  let localVideoUrl = $state<string | null>(null)
   let videoEl = $state<HTMLVideoElement | null>(null)
-  let tierPollInterval: number | undefined
+  let downloadStatus = $state<string>('idle')
+  let downloadError = $state<string | null>(null)
+  let downloadPollInterval: number | undefined
 
   declare global {
     interface Window {
@@ -87,41 +91,33 @@
   onMount(() => {
     loadYTApi().then(createPlayer)
     loadRoutine()
-    // Poll current time for timeline
     timeUpdateInterval = setInterval(() => {
       if (useLocalVideo) return
       if (player && playerReady) {
         currentTime = player.getCurrentTime()
         duration = player.getDuration() || duration
-        // Auto-apply segment speed
         applySegmentSpeed()
       }
     }, 250)
     return () => {
       clearInterval(timeUpdateInterval)
-      if (tierPollInterval) clearInterval(tierPollInterval)
+      if (downloadPollInterval) clearInterval(downloadPollInterval)
+      if (localVideoUrl) URL.revokeObjectURL(localVideoUrl)
       player?.destroy()
     }
   })
 
   async function loadRoutine() {
-    // Check if a routine already exists for this video
     const routines = await api.listRoutines()
-    const existing = routines.find((r: any) => {
-      // Match by checking alternates
-      return false // We'll match by routine source below
-    })
-    // Try to find by stored source_url
     for (const r of routines) {
       const full = await api.getRoutine(r.id)
       if (full.alternates?.some(a => a.youtube_url === sourceUrl || extractVideoId(a.youtube_url) === videoId)) {
         routine = full
         markers = (full.moves || []).sort((a, b) => a.start_time - b.start_time)
-        await loadSpeedTiers()
+        await checkLocalVideo()
         return
       }
     }
-    // No existing routine — that's fine, markers will be empty until the user adds them
   }
 
   function extractVideoId(url: string): string | null {
@@ -135,6 +131,95 @@
     return null
   }
 
+  // --- Local video (cached in IndexedDB, playbackRate for all speeds) ---
+
+  async function checkLocalVideo() {
+    if (!routine) return
+    // Check IndexedDB cache first
+    const cached = await getRoutineVideo(routine.id)
+    if (cached) {
+      localVideoUrl = URL.createObjectURL(cached)
+      switchToLocalVideo()
+      return
+    }
+    // Check if Pi has it downloaded
+    const status = await api.videoStatus(routine.id)
+    downloadStatus = status.status
+    downloadError = status.error
+    if (status.available) {
+      // Pi has it — fetch once and cache in IndexedDB
+      await cacheVideoFromPi()
+    }
+  }
+
+  async function triggerDownload() {
+    if (!routine) return
+    await api.downloadVideo(routine.id)
+    downloadStatus = 'downloading'
+    startDownloadPolling()
+  }
+
+  function startDownloadPolling() {
+    if (downloadPollInterval) return
+    downloadPollInterval = setInterval(async () => {
+      if (!routine) return
+      const status = await api.videoStatus(routine.id)
+      downloadStatus = status.status
+      downloadError = status.error
+      if (status.status === 'complete' || status.status === 'error' || status.status === 'idle') {
+        clearInterval(downloadPollInterval)
+        downloadPollInterval = undefined
+        if (status.available) {
+          await cacheVideoFromPi()
+        }
+      }
+    }, 3000)
+  }
+
+  async function cacheVideoFromPi() {
+    if (!routine) return
+    downloadStatus = 'caching'
+    try {
+      const blob = await api.fetchVideoBlob(routine.id)
+      await saveRoutineVideo(routine.id, blob)
+      localVideoUrl = URL.createObjectURL(blob)
+      switchToLocalVideo()
+      downloadStatus = 'complete'
+    } catch (e: any) {
+      downloadError = e.message || 'Failed to cache video'
+      downloadStatus = 'error'
+    }
+  }
+
+  function switchToLocalVideo() {
+    if (!localVideoUrl) return
+    if (player && playerReady) {
+      currentTime = player.getCurrentTime()
+      player.destroy()
+      player = null
+      playerReady = false
+    }
+    useLocalVideo = true
+  }
+
+  function switchToYouTube() {
+    const savedTime = currentTime
+    useLocalVideo = false
+    setTimeout(() => {
+      createPlayer()
+      if (player) {
+        const checkReady = setInterval(() => {
+          if (playerReady && player) {
+            player.seekTo(savedTime, true)
+            clearInterval(checkReady)
+          }
+        }, 200)
+      }
+    }, 100)
+  }
+
+  // --- Playback controls ---
+
   function applySegmentSpeed() {
     if (markers.length === 0) return
     const idx = findSegmentIndex(currentTime)
@@ -143,7 +228,9 @@
       const segmentSpeed = markers[idx].max_clean_speed
       if (Math.abs(segmentSpeed - speed) > 0.01) {
         speed = segmentSpeed
-        if (player && playerReady) {
+        if (useLocalVideo && videoEl) {
+          videoEl.playbackRate = speed
+        } else if (player && playerReady) {
           player.setPlaybackRate(speed)
         }
       }
@@ -158,15 +245,20 @@
   }
 
   $effect(() => {
-    if (useLocalVideo) {
-      applyLocalSpeed(speed)
+    if (useLocalVideo && videoEl) {
+      videoEl.playbackRate = speed
     } else if (playerReady && player) {
       player.setPlaybackRate(speed)
     }
   })
 
   function togglePlay() {
-    if (useLocalVideo) return toggleLocalPlay()
+    if (useLocalVideo) {
+      if (!videoEl) return
+      if (videoEl.paused) { videoEl.play(); isPlaying = true }
+      else { videoEl.pause(); isPlaying = false }
+      return
+    }
     if (!player || !playerReady) return
     if (isPlaying) player.pauseVideo()
     else player.playVideo()
@@ -174,7 +266,7 @@
 
   function skip(seconds: number) {
     if (useLocalVideo && videoEl) {
-      videoEl.currentTime += seconds / activeTierRate
+      videoEl.currentTime += seconds
       return
     }
     if (!player || !playerReady) return
@@ -182,31 +274,40 @@
   }
 
   function seekTo(time: number) {
-    if (useLocalVideo) return seekLocalTo(time)
+    if (useLocalVideo && videoEl) {
+      videoEl.currentTime = time
+      return
+    }
     if (!player || !playerReady) return
     player.seekTo(time, true)
   }
 
-  async function addMarker() {
-    if (!player || !playerReady) return
-    const time = player.getCurrentTime()
+  function onLocalTimeUpdate() {
+    if (!videoEl) return
+    currentTime = videoEl.currentTime
+    duration = videoEl.duration || 0
+    applySegmentSpeed()
+  }
 
-    // Create routine if it doesn't exist yet
+  // --- Markers ---
+
+  async function addMarker() {
+    const time = useLocalVideo && videoEl ? videoEl.currentTime : (player && playerReady ? player.getCurrentTime() : null)
+    if (time === null) return
+
     if (!routine) {
       routine = await api.createRoutine({ name: videoId, youtube_url: sourceUrl })
       routine = await api.getRoutine(routine.id)
     }
 
-    // Find where this marker fits
     const endTime = findNextMarkerTime(time)
-    const move = await api.createMove(routine!.id, {
+    await api.createMove(routine!.id, {
       name: `segment-${Date.now()}`,
       start_time: Math.round(time * 10) / 10,
       end_time: endTime,
       alternate_id: routine!.alternates?.[0]?.id,
     })
 
-    // Update previous marker's end time if needed
     const prevIdx = findPrevMarkerIndex(time)
     if (prevIdx >= 0) {
       await api.updateMove(routine!.id, markers[prevIdx].id, {
@@ -214,7 +315,6 @@
       })
     }
 
-    // Reload
     routine = await api.getRoutine(routine!.id)
     markers = (routine!.moves || []).sort((a, b) => a.start_time - b.start_time)
   }
@@ -258,148 +358,94 @@
     return (time / duration) * 100
   }
 
-  // --- Speed tier logic ---
+  // --- Attempt helpers ---
 
-  async function loadSpeedTiers() {
+  let attemptBlobUrls = $state<Record<number, string>>({})
+  let editingAttemptId = $state<number | null>(null)
+  let editingNotes = $state('')
+  let uploadingAttemptId = $state<number | null>(null)
+
+  function activeSegmentAttempts(): Attempt[] {
+    if (activeSegmentIndex < 0 || !markers[activeSegmentIndex]) return []
+    return markers[activeSegmentIndex].attempts || []
+  }
+
+  async function onAttemptRecorded(attempt: Attempt) {
     if (!routine) return
-    const result = await api.listSpeeds(routine.id)
-    speedTiers = result.tiers
-    tierStatus = result.status
-    tierError = result.error
-    // Auto-switch to local video if tiers are ready and we have 1.0x
-    if (speedTiers.length > 0 && speedTiers.some(t => t.rate === 1.0)) {
-      if (!useLocalVideo) switchToLocalVideo()
+    await loadAttemptBlob(attempt.id)
+    routine = await api.getRoutine(routine.id)
+    markers = (routine!.moves || []).sort((a, b) => a.start_time - b.start_time)
+    reviewingAttempt = attempt
+  }
+
+  async function loadAttemptBlob(attemptId: number) {
+    if (attemptBlobUrls[attemptId]) return
+    const blob = await getVideo(attemptId)
+    if (blob) {
+      attemptBlobUrls[attemptId] = URL.createObjectURL(blob)
     }
   }
 
-  async function triggerGeneration() {
-    if (!routine) return
-    await api.generateSpeeds(routine.id)
-    tierStatus = 'downloading'
-    // Poll for status
-    startTierPolling()
+  async function deleteAttemptHandler(attemptId: number) {
+    if (!routine || activeSegmentIndex < 0) return
+    const move = markers[activeSegmentIndex]
+    await api.deleteAttempt(routine.id, move.id, attemptId)
+    await deleteVideo(attemptId)
+    if (attemptBlobUrls[attemptId]) {
+      URL.revokeObjectURL(attemptBlobUrls[attemptId])
+      delete attemptBlobUrls[attemptId]
+    }
+    if (reviewingAttempt?.id === attemptId) reviewingAttempt = null
+    routine = await api.getRoutine(routine.id)
+    markers = (routine!.moves || []).sort((a, b) => a.start_time - b.start_time)
   }
 
-  function startTierPolling() {
-    if (tierPollInterval) return
-    tierPollInterval = setInterval(async () => {
+  async function playAttempt(attempt: Attempt) {
+    if (reviewingAttempt?.id === attempt.id) {
+      reviewingAttempt = null
+      return
+    }
+    await loadAttemptBlob(attempt.id)
+    reviewingAttempt = attempt
+  }
+
+  function attemptVideoSrc(attempt: Attempt): string | null {
+    return attemptBlobUrls[attempt.id] || null
+  }
+
+  function startEditingNotes(attempt: Attempt) {
+    editingAttemptId = attempt.id
+    editingNotes = attempt.notes || ''
+  }
+
+  async function saveNotes(attempt: Attempt) {
+    await api.updateAttempt(attempt.id, { notes: editingNotes })
+    editingAttemptId = null
+    if (!routine) return
+    routine = await api.getRoutine(routine.id)
+    markers = (routine!.moves || []).sort((a, b) => a.start_time - b.start_time)
+  }
+
+  async function uploadAttemptToYouTube(attempt: Attempt) {
+    uploadingAttemptId = attempt.id
+    try {
+      await loadAttemptBlob(attempt.id)
+      const blob = await getVideo(attempt.id)
+      if (!blob) throw new Error('Video not found locally')
+      const title = attempt.notes || `attempt ${attempt.id}`
+      const videoId = await api.uploadToYouTube(blob, title)
+      await api.updateAttempt(attempt.id, {
+        youtube_url: `https://www.youtube.com/watch?v=${videoId}`,
+        upload_status: 'on_youtube',
+      })
       if (!routine) return
-      const result = await api.listSpeeds(routine.id)
-      speedTiers = result.tiers
-      tierStatus = result.status
-      tierError = result.error
-      if (tierStatus === 'complete' || tierStatus === 'error' || tierStatus === 'idle') {
-        clearInterval(tierPollInterval)
-        tierPollInterval = undefined
-        if (tierStatus === 'complete') {
-          if (!useLocalVideo) switchToLocalVideo()
-        }
-      }
-    }, 3000)
-  }
-
-  function switchToLocalVideo() {
-    if (!routine || speedTiers.length === 0) return
-    // Capture current time before destroying
-    if (player && playerReady) {
-      currentTime = player.getCurrentTime()
-      player.destroy()
-      player = null
-      playerReady = false
+      routine = await api.getRoutine(routine.id)
+      markers = (routine!.moves || []).sort((a, b) => a.start_time - b.start_time)
+    } catch (e: any) {
+      alert(`Upload failed: ${e.message || 'unknown error'}`)
+    } finally {
+      uploadingAttemptId = null
     }
-    useLocalVideo = true
-    activeTierRate = 1.0
-  }
-
-  function switchToYouTube() {
-    const savedTime = currentTime
-    useLocalVideo = false
-    // Recreate YouTube player after Svelte re-renders the div
-    setTimeout(() => {
-      createPlayer()
-      // Seek to where local video was after player is ready
-      const origOnReady = player?.addEventListener
-      if (player) {
-        const checkReady = setInterval(() => {
-          if (playerReady && player) {
-            player.seekTo(savedTime, true)
-            clearInterval(checkReady)
-          }
-        }, 200)
-      }
-    }, 100)
-  }
-
-  /**
-   * Pick the best tier for a desired effective speed.
-   * effective_speed = tier_rate * browser_playbackRate
-   * We want browser_playbackRate to stay in a comfortable range (0.25-4.0).
-   * Pick the tier that minimizes |tier_rate * playbackRate - desired|
-   * while keeping playbackRate in [0.1, 4.0].
-   */
-  function selectTier(desiredSpeed: number): { tierRate: number; playbackRate: number } {
-    let bestTier = 1.0
-    let bestPlayback = desiredSpeed
-    let bestError = Infinity
-
-    for (const tier of speedTiers) {
-      const playback = desiredSpeed / tier.rate
-      // HTML5 playbackRate practical range
-      if (playback < 0.1 || playback > 4.0) continue
-      const error = Math.abs(tier.rate * playback - desiredSpeed)
-      // Prefer playbackRate closer to 1.0 for quality
-      const qualityPenalty = Math.abs(Math.log(playback))
-      const totalError = error + qualityPenalty * 0.1
-      if (totalError < bestError) {
-        bestError = totalError
-        bestTier = tier.rate
-        bestPlayback = playback
-      }
-    }
-
-    return { tierRate: bestTier, playbackRate: bestPlayback }
-  }
-
-  function applyLocalSpeed(desiredSpeed: number) {
-    if (!videoEl) return
-    const { tierRate, playbackRate } = selectTier(desiredSpeed)
-
-    // Switch tier file if needed
-    if (Math.abs(tierRate - activeTierRate) > 0.001 && routine) {
-      const wasTime = videoEl.currentTime * (activeTierRate / tierRate)
-      activeTierRate = tierRate
-      videoEl.src = api.speedTierUrl(routine.id, tierRate)
-      videoEl.currentTime = wasTime
-      videoEl.playbackRate = playbackRate
-      if (isPlaying) videoEl.play()
-    } else {
-      videoEl.playbackRate = playbackRate
-    }
-  }
-
-  // Track local video time
-  function onLocalTimeUpdate() {
-    if (!videoEl) return
-    // Convert local video time back to "original" time
-    currentTime = videoEl.currentTime * activeTierRate
-    duration = (videoEl.duration || 0) * activeTierRate
-    applySegmentSpeed()
-  }
-
-  function toggleLocalPlay() {
-    if (!videoEl) return
-    if (videoEl.paused) {
-      videoEl.play()
-      isPlaying = true
-    } else {
-      videoEl.pause()
-      isPlaying = false
-    }
-  }
-
-  function seekLocalTo(time: number) {
-    if (!videoEl) return
-    videoEl.currentTime = time / activeTierRate
   }
 
   // --- Timeline scrubbing ---
@@ -410,8 +456,7 @@
     if (!timelineEl || !duration) return
     const rect = timelineEl.getBoundingClientRect()
     const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
-    const time = pct * duration
-    seekTo(time)
+    seekTo(pct * duration)
   }
 
   function onTimelinePointerDown(e: PointerEvent) {
@@ -444,16 +489,16 @@
     style:transform={mirrored ? 'scaleX(-1)' : 'none'}
   >
     <div class="aspect-video">
-      {#if useLocalVideo && routine}
+      {#if useLocalVideo && localVideoUrl}
         <!-- svelte-ignore a11y_media_has_caption -->
         <video
           bind:this={videoEl}
-          src={api.speedTierUrl(routine.id, activeTierRate)}
+          src={localVideoUrl}
           class="w-full h-full"
           ontimeupdate={onLocalTimeUpdate}
           onplay={() => isPlaying = true}
           onpause={() => isPlaying = false}
-          onloadedmetadata={() => { if (videoEl) duration = videoEl.duration * activeTierRate }}
+          onloadedmetadata={() => { if (videoEl) duration = videoEl.duration }}
           playsinline
           autoplay
         ></video>
@@ -474,7 +519,6 @@
       onpointerup={onTimelinePointerUp}
       onpointercancel={onTimelinePointerUp}
     >
-      <!-- Segments colored by speed -->
       {#each markers as marker, i}
         {@const left = timelinePercent(marker.start_time)}
         {@const nextTime = i < markers.length - 1 ? markers[i + 1].start_time : duration}
@@ -495,13 +539,11 @@
         </div>
       {/each}
 
-      <!-- Playhead -->
       <div
         class="absolute top-0 w-0.5 h-full bg-white z-10 pointer-events-none"
         style:left="{timelinePercent(currentTime)}%"
       ></div>
 
-      <!-- Time label -->
       <span class="absolute top-1 right-2 text-[10px] text-neutral-500 z-10">
         {formatTime(currentTime)} / {formatTime(duration)}
       </span>
@@ -539,7 +581,7 @@
       </button>
     </div>
 
-    <!-- Speed control (applies to current segment if markers exist) -->
+    <!-- Speed control -->
     <SpeedControl
       bind:speed
       minSpeed={useLocalVideo ? 0.05 : 0.25}
@@ -583,6 +625,118 @@
       </div>
     {/if}
 
+    <!-- Attempt recording + review -->
+    {#if routine && activeSegmentIndex >= 0 && markers[activeSegmentIndex]}
+      <div class="flex flex-col gap-2 pt-2 border-t border-neutral-800">
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-neutral-500">
+            Attempts for segment at {formatTime(markers[activeSegmentIndex].start_time)}
+          </span>
+          <Recorder
+            routineId={routine.id}
+            moveId={markers[activeSegmentIndex].id}
+            onRecorded={onAttemptRecorded}
+          />
+        </div>
+
+        {#if reviewingAttempt}
+          {@const blobSrc = attemptVideoSrc(reviewingAttempt)}
+          <div class="w-full aspect-video bg-black rounded-lg overflow-hidden relative">
+            {#if blobSrc}
+              <!-- svelte-ignore a11y_media_has_caption -->
+              <video
+                src={blobSrc}
+                class="w-full h-full"
+                controls
+                playsinline
+                autoplay
+                style:transform={mirrored ? 'scaleX(-1)' : 'none'}
+              ></video>
+            {:else if reviewingAttempt.youtube_url}
+              <iframe
+                src="https://www.youtube.com/embed/{reviewingAttempt.youtube_url.split('v=')[1]}?autoplay=1&playsinline=1"
+                class="w-full h-full"
+                allow="autoplay"
+                title="Attempt recording"
+              ></iframe>
+            {:else}
+              <div class="w-full h-full flex items-center justify-center text-neutral-500 text-sm">
+                Video not available on this device
+              </div>
+            {/if}
+            <button
+              onclick={() => reviewingAttempt = null}
+              class="absolute top-2 right-2 bg-black/60 text-white rounded px-2 py-0.5 text-xs hover:bg-black/80"
+            >
+              close
+            </button>
+          </div>
+        {/if}
+
+        {#if activeSegmentAttempts().length > 0}
+          <div class="flex flex-col gap-1">
+            {#each activeSegmentAttempts() as attempt}
+              <div class="flex flex-col gap-1 group">
+                <div class="flex items-center gap-2 text-xs">
+                  <button
+                    onclick={() => playAttempt(attempt)}
+                    class="flex-1 text-left px-2 py-1 rounded hover:bg-neutral-800 transition-colors {reviewingAttempt?.id === attempt.id ? 'bg-neutral-800 text-white' : 'text-neutral-400'}"
+                  >
+                    <span class="text-neutral-500">{new Date(attempt.recorded + 'Z').toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span>
+                    {#if attempt.notes}
+                      <span class="ml-1.5 text-neutral-300">{attempt.notes}</span>
+                    {/if}
+                  </button>
+                  {#if attempt.upload_status === 'on_youtube'}
+                    <span class="text-[10px] text-green-600">yt</span>
+                  {:else if uploadingAttemptId === attempt.id}
+                    <div class="w-3 h-3 border border-neutral-400 border-t-transparent rounded-full animate-spin"></div>
+                  {:else}
+                    <button
+                      onclick={() => uploadAttemptToYouTube(attempt)}
+                      class="text-[10px] text-neutral-600 hover:text-neutral-300 opacity-0 group-hover:opacity-100 transition-opacity"
+                      title="Upload to YouTube"
+                    >
+                      yt↑
+                    </button>
+                  {/if}
+                  <button
+                    onclick={() => startEditingNotes(attempt)}
+                    class="text-neutral-600 hover:text-neutral-300 opacity-0 group-hover:opacity-100 transition-opacity text-[10px]"
+                    title="Name this recording"
+                  >
+                    ✎
+                  </button>
+                  <button
+                    onclick={() => deleteAttemptHandler(attempt.id)}
+                    class="text-neutral-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity text-xs"
+                  >
+                    x
+                  </button>
+                </div>
+                {#if editingAttemptId === attempt.id}
+                  <form
+                    onsubmit={(e) => { e.preventDefault(); saveNotes(attempt) }}
+                    class="flex items-center gap-1 px-2"
+                  >
+                    <input
+                      type="text"
+                      bind:value={editingNotes}
+                      placeholder="name this recording..."
+                      class="flex-1 bg-neutral-800 text-xs text-neutral-200 rounded px-2 py-1 border border-neutral-700 focus:border-neutral-500 outline-none"
+                      autofocus
+                    />
+                    <button type="submit" class="text-xs text-neutral-400 hover:text-white">save</button>
+                    <button type="button" onclick={() => editingAttemptId = null} class="text-xs text-neutral-600 hover:text-neutral-400">cancel</button>
+                  </form>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
+
     <!-- Mirror + info row -->
     <div class="flex justify-between items-center">
       {#if markers.length > 0}
@@ -605,11 +759,11 @@
       </button>
     </div>
 
-    <!-- Speed tiers -->
+    <!-- Local video (full speed range) -->
     {#if routine}
       <div class="flex items-center justify-between pt-2 border-t border-neutral-800">
         <div class="flex items-center gap-2">
-          {#if speedTiers.length > 0}
+          {#if localVideoUrl}
             <button
               onclick={() => useLocalVideo ? switchToYouTube() : switchToLocalVideo()}
               class="text-xs px-3 py-1.5 rounded border transition-colors {useLocalVideo
@@ -619,24 +773,24 @@
               {useLocalVideo ? 'local video' : 'youtube'}
             </button>
             {#if useLocalVideo}
-              <span class="text-[10px] text-neutral-500">tier: {activeTierRate}x · range: 0.05x–4x</span>
+              <span class="text-[10px] text-neutral-500">0.05x–4x</span>
             {/if}
           {/if}
         </div>
         <div>
-          {#if tierStatus === 'idle' && speedTiers.length === 0}
+          {#if downloadStatus === 'idle' && !localVideoUrl}
             <button
-              onclick={triggerGeneration}
+              onclick={triggerDownload}
               class="text-xs px-3 py-1.5 rounded bg-neutral-800 text-neutral-400 hover:text-white hover:bg-neutral-700 transition-colors border border-neutral-700"
             >
-              generate speed tiers
+              download for full speed range
             </button>
-          {:else if tierStatus === 'complete' || speedTiers.length > 0}
-            <span class="text-[10px] text-neutral-500">{speedTiers.length} tiers ready</span>
-          {:else if tierStatus === 'error'}
-            <span class="text-[10px] text-red-400" title={tierError || ''}>{tierError?.slice(0, 40) || 'error'}</span>
-          {:else}
-            <span class="text-[10px] text-amber-400">{tierStatus}...</span>
+          {:else if downloadStatus === 'complete' && localVideoUrl}
+            <span class="text-[10px] text-neutral-500">cached locally</span>
+          {:else if downloadStatus === 'error'}
+            <span class="text-[10px] text-red-400" title={downloadError || ''}>{downloadError?.slice(0, 40) || 'error'}</span>
+          {:else if downloadStatus !== 'idle'}
+            <span class="text-[10px] text-amber-400">{downloadStatus}...</span>
           {/if}
         </div>
       </div>

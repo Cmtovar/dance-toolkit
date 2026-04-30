@@ -3,7 +3,6 @@
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import json
-import mimetypes
 import os
 import shutil
 import sqlite3
@@ -15,12 +14,10 @@ PORT = 8091
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 DB_PATH = os.path.join(BASE_DIR, "database.db")
-SPEEDS_DIR = os.path.join(BASE_DIR, "speeds")
+VIDEOS_DIR = os.path.join(BASE_DIR, "videos")
 
-SPEED_TIERS = [0.25, 0.5, 0.75, 0.85, 1.0]
-
-# Track generation jobs: { routine_id: { "status": "...", "error": "..." } }
-_generation_jobs = {}
+# Track download jobs: { routine_id: { "status": "...", "error": "..." } }
+_download_jobs = {}
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -64,6 +61,15 @@ def init_db():
             drill_count INTEGER DEFAULT 0,
             sort_order INTEGER DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            move_id INTEGER NOT NULL REFERENCES moves(id) ON DELETE CASCADE,
+            youtube_url TEXT,
+            mime_type TEXT DEFAULT 'video/webm',
+            upload_status TEXT DEFAULT 'pending',
+            recorded TEXT DEFAULT (datetime('now')),
+            notes TEXT DEFAULT ''
+        );
     """)
     conn.commit()
     conn.close()
@@ -84,80 +90,54 @@ def get_youtube_url_for_routine(routine_id):
     return row["youtube_url"] if row else None
 
 
-def generate_speed_tiers(routine_id, youtube_url):
-    """Download video with yt-dlp and generate speed tier files with ffmpeg."""
-    _generation_jobs[routine_id] = {"status": "downloading", "error": None}
-    routine_dir = os.path.join(SPEEDS_DIR, str(routine_id))
-    os.makedirs(routine_dir, exist_ok=True)
-
-    original_path = os.path.join(routine_dir, "original.mp4")
+def download_video(routine_id, youtube_url):
+    """Download video with yt-dlp. Single file, no ffmpeg — client handles speed via playbackRate."""
+    _download_jobs[routine_id] = {"status": "downloading", "error": None}
+    video_path = os.path.join(VIDEOS_DIR, f"{routine_id}.mp4")
 
     try:
-        # Download with yt-dlp (skip if already downloaded)
-        if not os.path.isfile(original_path):
-            yt_dlp = shutil.which("yt-dlp") or os.path.expanduser("~/.local/bin/yt-dlp")
-            result = subprocess.run(
-                [yt_dlp, "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
-                 "--merge-output-format", "mp4", "-o", original_path, youtube_url],
-                capture_output=True, text=True, timeout=300
-            )
-            if result.returncode != 0:
-                _generation_jobs[routine_id] = {"status": "error", "error": f"yt-dlp failed: {result.stderr[:200]}"}
-                return
+        if os.path.isfile(video_path):
+            _download_jobs[routine_id] = {"status": "complete", "error": None}
+            return
 
-            if not os.path.isfile(original_path):
-                _generation_jobs[routine_id] = {"status": "error", "error": "Download produced no file"}
-                return
+        yt_dlp = shutil.which("yt-dlp") or os.path.expanduser("~/.local/bin/yt-dlp")
+        result = subprocess.run(
+            [yt_dlp, "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
+             "--merge-output-format", "mp4", "-o", video_path, youtube_url],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode != 0:
+            _download_jobs[routine_id] = {"status": "error", "error": f"yt-dlp failed: {result.stderr[:200]}"}
+            return
 
-        # Copy original as 1.0x tier
-        tier_1x = os.path.join(routine_dir, "1.0.mp4")
-        if not os.path.isfile(tier_1x):
-            shutil.copy2(original_path, tier_1x)
+        if not os.path.isfile(video_path):
+            _download_jobs[routine_id] = {"status": "error", "error": "Download produced no file"}
+            return
 
-        # Generate speed tiers with ffmpeg
-        for rate in SPEED_TIERS:
-            if rate == 1.0:
-                continue
-            _generation_jobs[routine_id] = {"status": f"generating {rate}x", "error": None}
-            tier_path = os.path.join(routine_dir, f"{rate}.mp4")
-            if os.path.isfile(tier_path):
-                continue
-
-            # atempo filter only accepts 0.5-2.0, chain for lower values
-            atempo_filters = []
-            remaining = rate
-            while remaining < 0.5:
-                atempo_filters.append("atempo=0.5")
-                remaining /= 0.5
-            atempo_filters.append(f"atempo={remaining:.4f}")
-            atempo_chain = ",".join(atempo_filters)
-
-            # Use faster preset for extreme slow tiers (they produce much longer videos)
-            preset = "ultrafast" if rate < 0.5 else "fast"
-            crf = "32" if rate < 0.5 else "28"
-
-            # setpts for video speed, atempo chain for audio
-            cmd = [
-                "ffmpeg", "-i", original_path,
-                "-filter:v", f"setpts={1/rate:.4f}*PTS",
-                "-filter:a", atempo_chain,
-                "-c:v", "libx264", "-preset", preset, "-crf", crf,
-                "-c:a", "aac", "-b:a", "128k",
-                "-y", tier_path
-            ]
-            # Longer timeout for slow tiers (0.25x creates 4x duration video)
-            tier_timeout = int(1800 / rate)  # 30min for 1x, 2h for 0.25x
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=tier_timeout)
-            if result.returncode != 0:
-                _generation_jobs[routine_id] = {"status": "error", "error": f"ffmpeg failed for {rate}x: {result.stderr[:200]}"}
-                return
-
-        _generation_jobs[routine_id] = {"status": "complete", "error": None}
+        _download_jobs[routine_id] = {"status": "complete", "error": None}
 
     except subprocess.TimeoutExpired:
-        _generation_jobs[routine_id] = {"status": "error", "error": "Process timed out"}
+        _download_jobs[routine_id] = {"status": "error", "error": "Download timed out"}
     except Exception as e:
-        _generation_jobs[routine_id] = {"status": "error", "error": str(e)[:200]}
+        _download_jobs[routine_id] = {"status": "error", "error": str(e)[:200]}
+
+
+def get_fresh_youtube_token():
+    """Load token.json, refresh if expired, return access_token string."""
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+
+    token_path = os.path.join(BASE_DIR, "token.json")
+    if not os.path.isfile(token_path):
+        return None
+
+    creds = Credentials.from_authorized_user_file(token_path)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        with open(token_path, "w") as f:
+            f.write(creds.to_json())
+
+    return creds.token
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -179,13 +159,24 @@ class Handler(SimpleHTTPRequestHandler):
         if len(parts) == 3 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit():
             return self.handle_get_routine(int(parts[2]))
 
-        # /api/routines/123/speeds
-        if len(parts) == 4 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit() and parts[3] == "speeds":
-            return self.handle_list_speeds(int(parts[2]))
+        # /api/youtube/token — serve fresh OAuth access token to client
+        if path == "/api/youtube/token":
+            return self.handle_youtube_token()
 
-        # /api/routines/123/speeds/0.5
-        if len(parts) == 5 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit() and parts[3] == "speeds":
-            return self.handle_serve_speed(int(parts[2]), parts[4])
+        # /api/attempts — all attempts across all routines
+        if path == "/api/attempts":
+            return self.handle_all_attempts()
+
+        # /api/routines/123/moves/456/attempts
+        if len(parts) == 6 and parts[0] == "api" and parts[1] == "routines" and parts[3] == "moves" and parts[5] == "attempts":
+            return self.handle_list_attempts(int(parts[4]))
+
+        # /api/routines/123/video/status
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit() and parts[3] == "video":
+            return self.handle_serve_video(int(parts[2]))
+
+        if len(parts) == 5 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit() and parts[3] == "video" and parts[4] == "status":
+            return self.handle_video_status(int(parts[2]))
 
         # Static file serving with SPA fallback
         file_path = os.path.join(STATIC_DIR, path.lstrip("/"))
@@ -196,12 +187,12 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        parts = path.strip("/").split("/")
+
         body = self.read_body()
 
         if path == "/api/routines":
             return self.handle_create_routine(body)
-
-        parts = path.strip("/").split("/")
 
         # /api/routines/123/alternates
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit() and parts[3] == "alternates":
@@ -211,9 +202,13 @@ class Handler(SimpleHTTPRequestHandler):
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit() and parts[3] == "moves":
             return self.handle_create_move(int(parts[2]), body)
 
-        # /api/routines/123/generate-speeds
-        if len(parts) == 4 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit() and parts[3] == "generate-speeds":
-            return self.handle_generate_speeds(int(parts[2]))
+        # /api/routines/123/download-video
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit() and parts[3] == "download-video":
+            return self.handle_download_video(int(parts[2]))
+
+        # /api/routines/123/moves/456/attempts — create attempt (metadata only)
+        if len(parts) == 6 and parts[0] == "api" and parts[1] == "routines" and parts[3] == "moves" and parts[5] == "attempts":
+            return self.handle_create_attempt(int(parts[4]), body)
 
         # /api/routines/123/moves/456/drill
         if len(parts) == 6 and parts[0] == "api" and parts[1] == "routines" and parts[3] == "moves" and parts[5] == "drill":
@@ -224,8 +219,9 @@ class Handler(SimpleHTTPRequestHandler):
     def do_PUT(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-        body = self.read_body()
         parts = path.strip("/").split("/")
+
+        body = self.read_body()
 
         # /api/routines/123
         if len(parts) == 3 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit():
@@ -238,6 +234,10 @@ class Handler(SimpleHTTPRequestHandler):
         # /api/routines/123/moves/456
         if len(parts) == 5 and parts[1] == "routines" and parts[3] == "moves" and parts[4].isdigit():
             return self.handle_update_move(int(parts[4]), body)
+
+        # /api/attempts/123 — update attempt metadata (e.g. youtube_url after client upload)
+        if len(parts) == 3 and parts[0] == "api" and parts[1] == "attempts" and parts[2].isdigit():
+            return self.handle_update_attempt(int(parts[2]), body)
 
         self.send_error_json(404, "Not found")
 
@@ -257,6 +257,10 @@ class Handler(SimpleHTTPRequestHandler):
         # /api/routines/123/moves/456
         if len(parts) == 5 and parts[1] == "routines" and parts[3] == "moves" and parts[4].isdigit():
             return self.handle_delete_move(int(parts[4]))
+
+        # /api/routines/123/moves/456/attempts/789
+        if len(parts) == 7 and parts[1] == "routines" and parts[3] == "moves" and parts[5] == "attempts" and parts[6].isdigit():
+            return self.handle_delete_attempt(int(parts[6]))
 
         self.send_error_json(404, "Not found")
 
@@ -289,6 +293,11 @@ class Handler(SimpleHTTPRequestHandler):
         moves = rows_to_list(
             conn.execute("SELECT * FROM moves WHERE routine_id = ? ORDER BY sort_order, start_time", (routine_id,)).fetchall()
         )
+        # Attach attempts to each move
+        for m in moves:
+            m["attempts"] = rows_to_list(
+                conn.execute("SELECT * FROM attempts WHERE move_id = ? ORDER BY recorded DESC", (m["id"],)).fetchall()
+            )
         result["moves"] = moves
         result["timing_floor"] = min((m["max_clean_speed"] for m in moves), default=None)
         conn.close()
@@ -432,62 +441,120 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_error_json(404, "Move not found")
         self.send_json(dict(result))
 
-    # --- Speed tier handlers ---
+    # --- Attempt handlers ---
 
-    def handle_generate_speeds(self, routine_id):
-        # Check if already running
-        job = _generation_jobs.get(routine_id)
+    def handle_create_attempt(self, move_id, body):
+        """Create attempt record (metadata only). Client holds the video in IndexedDB."""
+        mime_type = body.get("mime_type", "video/webm")
+        conn = get_db()
+        cur = conn.execute(
+            "INSERT INTO attempts (move_id, mime_type, upload_status, notes) VALUES (?, ?, 'pending', ?)",
+            (move_id, mime_type, body.get("notes", ""))
+        )
+        conn.commit()
+        result = dict(conn.execute("SELECT * FROM attempts WHERE id = ?", (cur.lastrowid,)).fetchone())
+        conn.close()
+        self.send_json(result, status=201)
+
+    def handle_update_attempt(self, attempt_id, body):
+        """Update attempt metadata — client calls this after uploading to YouTube."""
+        conn = get_db()
+        fields = []
+        values = []
+        for key in ("youtube_url", "upload_status", "notes"):
+            if key in body:
+                fields.append(f"{key} = ?")
+                values.append(body[key])
+        if fields:
+            values.append(attempt_id)
+            conn.execute(f"UPDATE attempts SET {', '.join(fields)} WHERE id = ?", values)
+            conn.commit()
+        result = conn.execute("SELECT * FROM attempts WHERE id = ?", (attempt_id,)).fetchone()
+        conn.close()
+        if not result:
+            return self.send_error_json(404, "Attempt not found")
+        self.send_json(dict(result))
+
+    def handle_all_attempts(self):
+        """List all attempts across all routines, with context."""
+        conn = get_db()
+        attempts = rows_to_list(conn.execute(
+            "SELECT a.*, m.name as move_name, m.start_time, m.routine_id, r.name as routine_name "
+            "FROM attempts a "
+            "JOIN moves m ON a.move_id = m.id "
+            "JOIN routines r ON m.routine_id = r.id "
+            "ORDER BY a.recorded DESC"
+        ).fetchall())
+        conn.close()
+        self.send_json(attempts)
+
+    def handle_list_attempts(self, move_id):
+        conn = get_db()
+        attempts = rows_to_list(conn.execute(
+            "SELECT * FROM attempts WHERE move_id = ? ORDER BY recorded DESC", (move_id,)
+        ).fetchall())
+        conn.close()
+        self.send_json(attempts)
+
+    def handle_delete_attempt(self, attempt_id):
+        conn = get_db()
+        conn.execute("DELETE FROM attempts WHERE id = ?", (attempt_id,))
+        conn.commit()
+        conn.close()
+        self.send_json({"deleted": True})
+
+    # --- YouTube token handler ---
+
+    def handle_youtube_token(self):
+        """Serve a fresh OAuth access token so the client can upload directly to YouTube."""
+        try:
+            token = get_fresh_youtube_token()
+        except Exception as e:
+            return self.send_error_json(500, f"Token refresh failed: {str(e)[:200]}")
+        if not token:
+            return self.send_error_json(404, "YouTube not configured — run setup_youtube_oauth.py on Pi")
+        self.send_json({"access_token": token})
+
+    # --- Video download handlers ---
+
+    def handle_download_video(self, routine_id):
+        job = _download_jobs.get(routine_id)
         if job and job["status"] not in ("complete", "error"):
-            return self.send_json({"status": job["status"], "message": "Generation already in progress"})
+            return self.send_json({"status": job["status"], "message": "Download already in progress"})
 
         youtube_url = get_youtube_url_for_routine(routine_id)
         if not youtube_url:
             return self.send_error_json(400, "No YouTube URL found for this routine")
 
-        # Start generation in background thread
-        thread = threading.Thread(target=generate_speed_tiers, args=(routine_id, youtube_url), daemon=True)
+        thread = threading.Thread(target=download_video, args=(routine_id, youtube_url), daemon=True)
         thread.start()
-        self.send_json({"status": "started", "tiers": SPEED_TIERS})
+        self.send_json({"status": "started"})
 
-    def handle_list_speeds(self, routine_id):
-        routine_dir = os.path.join(SPEEDS_DIR, str(routine_id))
-        available = []
-        if os.path.isdir(routine_dir):
-            for rate in SPEED_TIERS:
-                tier_path = os.path.join(routine_dir, f"{rate}.mp4")
-                if os.path.isfile(tier_path):
-                    size = os.path.getsize(tier_path)
-                    available.append({"rate": rate, "size": size})
-
-        job = _generation_jobs.get(routine_id, {"status": "idle", "error": None})
+    def handle_video_status(self, routine_id):
+        video_path = os.path.join(VIDEOS_DIR, f"{routine_id}.mp4")
+        available = os.path.isfile(video_path)
+        size = os.path.getsize(video_path) if available else 0
+        job = _download_jobs.get(routine_id, {"status": "idle", "error": None})
         self.send_json({
-            "tiers": available,
+            "available": available,
+            "size": size,
             "status": job["status"],
             "error": job.get("error"),
         })
 
-    def handle_serve_speed(self, routine_id, rate_str):
-        # Strip .mp4 extension if present
-        rate_str = rate_str.replace(".mp4", "")
-        try:
-            rate = float(rate_str)
-        except ValueError:
-            return self.send_error_json(400, "Invalid rate")
+    def handle_serve_video(self, routine_id):
+        video_path = os.path.join(VIDEOS_DIR, f"{routine_id}.mp4")
+        if not os.path.isfile(video_path):
+            return self.send_error_json(404, "Video not downloaded yet")
 
-        tier_path = os.path.join(SPEEDS_DIR, str(routine_id), f"{rate}.mp4")
-        if not os.path.isfile(tier_path):
-            return self.send_error_json(404, "Speed tier not found")
-
-        # Serve the video file with range request support
-        file_size = os.path.getsize(tier_path)
+        file_size = os.path.getsize(video_path)
         range_header = self.headers.get("Range")
 
         if range_header:
-            # Parse range header
             range_match = range_header.strip().replace("bytes=", "")
-            parts = range_match.split("-")
-            start = int(parts[0]) if parts[0] else 0
-            end = int(parts[1]) if parts[1] else file_size - 1
+            range_parts = range_match.split("-")
+            start = int(range_parts[0]) if range_parts[0] else 0
+            end = int(range_parts[1]) if range_parts[1] else file_size - 1
             length = end - start + 1
 
             self.send_response(206)
@@ -498,7 +565,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
-            with open(tier_path, "rb") as f:
+            with open(video_path, "rb") as f:
                 f.seek(start)
                 self.wfile.write(f.read(length))
         else:
@@ -509,7 +576,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
-            with open(tier_path, "rb") as f:
+            with open(video_path, "rb") as f:
                 shutil.copyfileobj(f, self.wfile)
 
     # --- Helpers ---
@@ -540,7 +607,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
     def log_message(self, format, *args):
@@ -549,7 +616,15 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
-    os.makedirs(SPEEDS_DIR, exist_ok=True)
+    os.makedirs(VIDEOS_DIR, exist_ok=True)
     server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Dance Toolkit serving on port {PORT}")
+    try:
+        token = get_fresh_youtube_token()
+        if token:
+            print("YouTube OAuth: configured (client can upload directly)")
+        else:
+            print("YouTube OAuth: not configured (run setup_youtube_oauth.py)")
+    except Exception:
+        print("YouTube OAuth: not configured (run setup_youtube_oauth.py)")
     server.serve_forever()
