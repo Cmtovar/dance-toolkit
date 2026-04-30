@@ -1,7 +1,15 @@
 <script lang="ts">
-  let { speed = $bindable(1.0), onSpeedChange }: { speed: number; onSpeedChange?: (s: number) => void } = $props()
+  let { speed = $bindable(1.0), minSpeed = 0.25, maxSpeed = 2.0, onSpeedChange }: {
+    speed: number
+    minSpeed?: number
+    maxSpeed?: number
+    onSpeedChange?: (s: number) => void
+  } = $props()
 
-  const presets = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+  const basePresets = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+  const extendedPresets = [0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]
+
+  let presets = $derived(maxSpeed > 2.0 ? extendedPresets : basePresets)
 
   function setSpeed(s: number) {
     speed = s
@@ -14,7 +22,7 @@
   }
 
   function nudge(amount: number) {
-    setSpeed(Math.round(Math.max(0.25, Math.min(2.0, speed + amount)) * 100) / 100)
+    setSpeed(Math.round(Math.max(minSpeed, Math.min(maxSpeed, speed + amount)) * 100) / 100)
   }
 </script>
 
@@ -41,8 +49,8 @@
   <!-- Slider -->
   <input
     type="range"
-    min="0.25"
-    max="2.0"
+    min={minSpeed}
+    max={maxSpeed}
     step="0.01"
     value={speed}
     oninput={handleSlider}

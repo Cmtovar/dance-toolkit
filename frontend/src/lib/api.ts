@@ -77,4 +77,13 @@ export const api = {
 
   drillMove: (routineId: number, id: number): Promise<Move> =>
     request(`/api/routines/${routineId}/moves/${id}/drill`, { method: 'POST' }),
+
+  generateSpeeds: (routineId: number): Promise<{ status: string; tiers?: number[] }> =>
+    request(`/api/routines/${routineId}/generate-speeds`, { method: 'POST' }),
+
+  listSpeeds: (routineId: number): Promise<{ tiers: { rate: number; size: number }[]; status: string; error: string | null }> =>
+    request(`/api/routines/${routineId}/speeds`),
+
+  speedTierUrl: (routineId: number, rate: number): string =>
+    `${BASE}/api/routines/${routineId}/speeds/${rate}`,
 }

@@ -3,14 +3,24 @@
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import json
+import mimetypes
 import os
+import shutil
 import sqlite3
+import subprocess
+import threading
 import urllib.parse
 
 PORT = 8091
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 DB_PATH = os.path.join(BASE_DIR, "database.db")
+SPEEDS_DIR = os.path.join(BASE_DIR, "speeds")
+
+SPEED_TIERS = [0.25, 0.5, 0.75, 0.85, 1.0]
+
+# Track generation jobs: { routine_id: { "status": "...", "error": "..." } }
+_generation_jobs = {}
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -63,6 +73,93 @@ def rows_to_list(rows):
     return [dict(r) for r in rows]
 
 
+def get_youtube_url_for_routine(routine_id):
+    """Get the first alternate's YouTube URL for a routine."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT youtube_url FROM alternates WHERE routine_id = ? ORDER BY sort_order LIMIT 1",
+        (routine_id,)
+    ).fetchone()
+    conn.close()
+    return row["youtube_url"] if row else None
+
+
+def generate_speed_tiers(routine_id, youtube_url):
+    """Download video with yt-dlp and generate speed tier files with ffmpeg."""
+    _generation_jobs[routine_id] = {"status": "downloading", "error": None}
+    routine_dir = os.path.join(SPEEDS_DIR, str(routine_id))
+    os.makedirs(routine_dir, exist_ok=True)
+
+    original_path = os.path.join(routine_dir, "original.mp4")
+
+    try:
+        # Download with yt-dlp (skip if already downloaded)
+        if not os.path.isfile(original_path):
+            yt_dlp = shutil.which("yt-dlp") or os.path.expanduser("~/.local/bin/yt-dlp")
+            result = subprocess.run(
+                [yt_dlp, "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
+                 "--merge-output-format", "mp4", "-o", original_path, youtube_url],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode != 0:
+                _generation_jobs[routine_id] = {"status": "error", "error": f"yt-dlp failed: {result.stderr[:200]}"}
+                return
+
+            if not os.path.isfile(original_path):
+                _generation_jobs[routine_id] = {"status": "error", "error": "Download produced no file"}
+                return
+
+        # Copy original as 1.0x tier
+        tier_1x = os.path.join(routine_dir, "1.0.mp4")
+        if not os.path.isfile(tier_1x):
+            shutil.copy2(original_path, tier_1x)
+
+        # Generate speed tiers with ffmpeg
+        for rate in SPEED_TIERS:
+            if rate == 1.0:
+                continue
+            _generation_jobs[routine_id] = {"status": f"generating {rate}x", "error": None}
+            tier_path = os.path.join(routine_dir, f"{rate}.mp4")
+            if os.path.isfile(tier_path):
+                continue
+
+            # atempo filter only accepts 0.5-2.0, chain for lower values
+            atempo_filters = []
+            remaining = rate
+            while remaining < 0.5:
+                atempo_filters.append("atempo=0.5")
+                remaining /= 0.5
+            atempo_filters.append(f"atempo={remaining:.4f}")
+            atempo_chain = ",".join(atempo_filters)
+
+            # Use faster preset for extreme slow tiers (they produce much longer videos)
+            preset = "ultrafast" if rate < 0.5 else "fast"
+            crf = "32" if rate < 0.5 else "28"
+
+            # setpts for video speed, atempo chain for audio
+            cmd = [
+                "ffmpeg", "-i", original_path,
+                "-filter:v", f"setpts={1/rate:.4f}*PTS",
+                "-filter:a", atempo_chain,
+                "-c:v", "libx264", "-preset", preset, "-crf", crf,
+                "-c:a", "aac", "-b:a", "128k",
+                "-y", tier_path
+            ]
+            # Longer timeout for slow tiers (0.25x creates 4x duration video)
+            tier_timeout = int(1800 / rate)  # 30min for 1x, 2h for 0.25x
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=tier_timeout)
+            if result.returncode != 0:
+                _generation_jobs[routine_id] = {"status": "error", "error": f"ffmpeg failed for {rate}x: {result.stderr[:200]}"}
+                return
+
+        _generation_jobs[routine_id] = {"status": "complete", "error": None}
+
+    except subprocess.TimeoutExpired:
+        _generation_jobs[routine_id] = {"status": "error", "error": "Process timed out"}
+    except Exception as e:
+        _generation_jobs[routine_id] = {"status": "error", "error": str(e)[:200]}
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=STATIC_DIR, **kwargs)
@@ -81,6 +178,14 @@ class Handler(SimpleHTTPRequestHandler):
         parts = path.strip("/").split("/")
         if len(parts) == 3 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit():
             return self.handle_get_routine(int(parts[2]))
+
+        # /api/routines/123/speeds
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit() and parts[3] == "speeds":
+            return self.handle_list_speeds(int(parts[2]))
+
+        # /api/routines/123/speeds/0.5
+        if len(parts) == 5 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit() and parts[3] == "speeds":
+            return self.handle_serve_speed(int(parts[2]), parts[4])
 
         # Static file serving with SPA fallback
         file_path = os.path.join(STATIC_DIR, path.lstrip("/"))
@@ -105,6 +210,10 @@ class Handler(SimpleHTTPRequestHandler):
         # /api/routines/123/moves
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit() and parts[3] == "moves":
             return self.handle_create_move(int(parts[2]), body)
+
+        # /api/routines/123/generate-speeds
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "routines" and parts[2].isdigit() and parts[3] == "generate-speeds":
+            return self.handle_generate_speeds(int(parts[2]))
 
         # /api/routines/123/moves/456/drill
         if len(parts) == 6 and parts[0] == "api" and parts[1] == "routines" and parts[3] == "moves" and parts[5] == "drill":
@@ -323,6 +432,86 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_error_json(404, "Move not found")
         self.send_json(dict(result))
 
+    # --- Speed tier handlers ---
+
+    def handle_generate_speeds(self, routine_id):
+        # Check if already running
+        job = _generation_jobs.get(routine_id)
+        if job and job["status"] not in ("complete", "error"):
+            return self.send_json({"status": job["status"], "message": "Generation already in progress"})
+
+        youtube_url = get_youtube_url_for_routine(routine_id)
+        if not youtube_url:
+            return self.send_error_json(400, "No YouTube URL found for this routine")
+
+        # Start generation in background thread
+        thread = threading.Thread(target=generate_speed_tiers, args=(routine_id, youtube_url), daemon=True)
+        thread.start()
+        self.send_json({"status": "started", "tiers": SPEED_TIERS})
+
+    def handle_list_speeds(self, routine_id):
+        routine_dir = os.path.join(SPEEDS_DIR, str(routine_id))
+        available = []
+        if os.path.isdir(routine_dir):
+            for rate in SPEED_TIERS:
+                tier_path = os.path.join(routine_dir, f"{rate}.mp4")
+                if os.path.isfile(tier_path):
+                    size = os.path.getsize(tier_path)
+                    available.append({"rate": rate, "size": size})
+
+        job = _generation_jobs.get(routine_id, {"status": "idle", "error": None})
+        self.send_json({
+            "tiers": available,
+            "status": job["status"],
+            "error": job.get("error"),
+        })
+
+    def handle_serve_speed(self, routine_id, rate_str):
+        # Strip .mp4 extension if present
+        rate_str = rate_str.replace(".mp4", "")
+        try:
+            rate = float(rate_str)
+        except ValueError:
+            return self.send_error_json(400, "Invalid rate")
+
+        tier_path = os.path.join(SPEEDS_DIR, str(routine_id), f"{rate}.mp4")
+        if not os.path.isfile(tier_path):
+            return self.send_error_json(404, "Speed tier not found")
+
+        # Serve the video file with range request support
+        file_size = os.path.getsize(tier_path)
+        range_header = self.headers.get("Range")
+
+        if range_header:
+            # Parse range header
+            range_match = range_header.strip().replace("bytes=", "")
+            parts = range_match.split("-")
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if parts[1] else file_size - 1
+            length = end - start + 1
+
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            with open(tier_path, "rb") as f:
+                f.seek(start)
+                self.wfile.write(f.read(length))
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            with open(tier_path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+
     # --- Helpers ---
 
     def read_body(self):
@@ -360,6 +549,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
+    os.makedirs(SPEEDS_DIR, exist_ok=True)
     server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Dance Toolkit serving on port {PORT}")
     server.serve_forever()
